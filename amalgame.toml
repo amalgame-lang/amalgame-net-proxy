@@ -16,9 +16,9 @@
 
 [package]
 name              = "amalgame-net-proxy"
-version           = "0.2.0"
+version           = "0.2.1"
 license           = "Apache-2.0"
-description       = "HTTP/1.1 reverse proxy + load balancing for the Mosaic stack. v0.2.0: UpstreamPool with weighted round-robin + ip-hash (sticky) across N backends (ForwardPool). v0.1: longest-prefix routing, X-Forwarded-For, hop-by-hop stripping, HTTPS upstreams. The nginx/Apache front-door slice."
+description       = "HTTP/1.1 reverse proxy + load balancing for the Mosaic stack. v0.2.1: least-connections strategy (active-conn tracking). v0.2.0: UpstreamPool with weighted round-robin + ip-hash (sticky) across N backends (ForwardPool). v0.1: longest-prefix routing, X-Forwarded-For, hop-by-hop stripping, HTTPS upstreams. The nginx/Apache front-door slice."
 required-amalgame = ">=0.8.58"
 schema-version    = 1
 

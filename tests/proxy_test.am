@@ -152,6 +152,25 @@ public class Program {
             Console.WriteLine("[FAIL] ForwardPool routing")
         }
 
+        // ── 13. Least-connections spreads load + Release frees slot ─
+        let lc = UpstreamPool.New()
+            .Add("http://a:1")
+            .Add("http://b:1")
+            .Add("http://c:1")
+            .LeastConnections()
+        let q1: UpstreamBackend = lc.PickBackend("")   // a (all 0, tie→first)
+        let q2: UpstreamBackend = lc.PickBackend("")   // b (a now 1)
+        let q3: UpstreamBackend = lc.PickBackend("")   // c
+        let spread: bool = q1.Url != q2.Url && q2.Url != q3.Url && q1.Url != q3.Url
+        // release q1 → its backend drops to 0 in-flight; next pick takes it.
+        lc.Release(q1)
+        let q4: UpstreamBackend = lc.PickBackend("")
+        if (spread && q4.Url == q1.Url) {
+            Console.WriteLine("[PASS] least-connections spreads load + Release frees the slot")
+        } else {
+            Console.WriteLine("[FAIL] least-conn: spread=" + q1.Url + "," + q2.Url + "," + q3.Url + " q4=" + q4.Url)
+        }
+
         Console.WriteLine("done")
     }
 }
