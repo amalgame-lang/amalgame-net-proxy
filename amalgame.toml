@@ -1,0 +1,33 @@
+# amalgame-net-proxy — HTTP/1.1 reverse proxy for the Mosaic stack.
+#
+# The "front door" half of nginx/Apache: terminate the client
+# connection, pick an upstream by path prefix, forward the request,
+# stream the response back. Built entirely on amalgame-net-http
+# (server side for the listener, HttpClient for the upstream leg).
+#
+# Install:
+#   amc package add net-proxy
+#
+# Depends on:
+#   - amalgame-net-http (server + HttpClient) — pulls amalgame-tls +
+#     amalgame-async transitively.
+#
+# See roadmap: docs/proposals/beyond-http.md §1 (Reverse proxy).
+
+[package]
+name              = "amalgame-net-proxy"
+version           = "0.1.0"
+license           = "Apache-2.0"
+description       = "HTTP/1.1 reverse proxy — ReverseProxy.Forward(prefix, backend) routes by longest path prefix, injects X-Forwarded-For, strips hop-by-hop headers, and serves on top of amalgame-net-http. The nginx/Apache front-door slice of the Mosaic stack."
+required-amalgame = ">=0.8.58"
+schema-version    = 1
+
+[stdlib]
+classes   = ["ReverseProxy", "ProxyRoute"]
+header    = "runtime/Amalgame_Net_Proxy.h"
+namespace = "Amalgame.Net.Proxy"
+facade    = "facade.am"
+libs      = []
+
+[dependencies]
+amalgame-net-http = ">=0.11.1"

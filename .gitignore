@@ -1,0 +1,7 @@
+*.o
+*.c
+a.out
+/proxy
+/test
+build/
+*.tmp

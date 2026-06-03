@@ -1,0 +1,94 @@
+// Unit tests for ReverseProxy — the network-free surface: longest-
+// prefix routing, hop-by-hop classification, X-Forwarded-For chain
+// building. The actual upstream round-trip (Handle → HttpClient.Send)
+// needs a live backend and is exercised manually / in integration —
+// see the README's "End-to-end" snippet.
+
+namespace Tests
+
+import Amalgame.Collections
+import Amalgame.String
+import Amalgame.Net.Http
+import Amalgame.Net.Proxy
+
+public class Program {
+    public static void Main(string[] args) {
+        Console.WriteLine("amalgame-net-proxy — ReverseProxy tests")
+
+        // ── 1. Longest-prefix routing, order-independent ─────────
+        let p = ReverseProxy.New()
+            .Forward("/",        "http://web:8080")
+            .Forward("/api",     "http://api:8081")
+            .Forward("/api/v2",  "http://api-v2:8082")
+        if (p.MatchBackend("/api/v2/users") == "http://api-v2:8082") {
+            Console.WriteLine("[PASS] longest prefix wins (/api/v2 over /api over /)")
+        } else {
+            Console.WriteLine("[FAIL] longest prefix: " + p.MatchBackend("/api/v2/users"))
+        }
+
+        // ── 2. Shorter prefix still routes correctly ─────────────
+        if (p.MatchBackend("/api/users") == "http://api:8081") {
+            Console.WriteLine("[PASS] /api/users → /api backend")
+        } else {
+            Console.WriteLine("[FAIL] /api/users → " + p.MatchBackend("/api/users"))
+        }
+
+        // ── 3. Catch-all "/" handles the rest ────────────────────
+        if (p.MatchBackend("/about") == "http://web:8080") {
+            Console.WriteLine("[PASS] catch-all / routes unmatched paths")
+        } else {
+            Console.WriteLine("[FAIL] catch-all: " + p.MatchBackend("/about"))
+        }
+
+        // ── 4. Prefix boundary: /api must NOT match /apixyz ──────
+        let p2 = ReverseProxy.New().Forward("/api", "http://api:8081")
+        if (p2.MatchBackend("/apixyz") == "" && p2.MatchBackend("/api") == "http://api:8081") {
+            Console.WriteLine("[PASS] prefix boundary (/api ≠ /apixyz, /api == /api)")
+        } else {
+            Console.WriteLine("[FAIL] boundary: apixyz=" + p2.MatchBackend("/apixyz") + " api=" + p2.MatchBackend("/api"))
+        }
+
+        // ── 5. No route → empty (Handle turns this into 502) ─────
+        let p3 = ReverseProxy.New().Forward("/api", "http://api:8081")
+        if (p3.MatchBackend("/static/x.png") == "") {
+            Console.WriteLine("[PASS] no matching route → \"\"")
+        } else {
+            Console.WriteLine("[FAIL] no-route should be empty")
+        }
+
+        // ── 6. Hop-by-hop classification ─────────────────────────
+        let hopOk: bool = ReverseProxy.IsHopByHop("connection")
+            && ReverseProxy.IsHopByHop("transfer-encoding")
+            && ReverseProxy.IsHopByHop("host")
+            && ReverseProxy.IsHopByHop("content-length")
+        let passThru: bool = !ReverseProxy.IsHopByHop("content-type")
+            && !ReverseProxy.IsHopByHop("authorization")
+            && !ReverseProxy.IsHopByHop("set-cookie")
+        if (hopOk && passThru) {
+            Console.WriteLine("[PASS] hop-by-hop dropped, app headers passed through")
+        } else {
+            Console.WriteLine("[FAIL] hop-by-hop classification")
+        }
+
+        // ── 7. X-Forwarded-For: fresh request → just the client IP ─
+        let req = new HttpRequest()
+        req.RemoteAddr = "192.0.2.7:55001"
+        if (p.ForwardedFor(req) == "192.0.2.7") {
+            Console.WriteLine("[PASS] XFF strips :port → client IP")
+        } else {
+            Console.WriteLine("[FAIL] XFF fresh: " + p.ForwardedFor(req))
+        }
+
+        // ── 8. X-Forwarded-For: append to an existing chain ──────
+        let req2 = new HttpRequest()
+        req2.RemoteAddr = "192.0.2.7:55001"
+        req2.Headers.Set("x-forwarded-for", "203.0.113.5")
+        if (p.ForwardedFor(req2) == "203.0.113.5, 192.0.2.7") {
+            Console.WriteLine("[PASS] XFF appends to an inbound chain")
+        } else {
+            Console.WriteLine("[FAIL] XFF append: " + p.ForwardedFor(req2))
+        }
+
+        Console.WriteLine("done")
+    }
+}

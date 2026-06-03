@@ -1,0 +1,234 @@
+// amalgame-net-proxy — HTTP/1.1 reverse proxy (v0.1.0).
+//
+// The "front door" pattern: terminate the client connection, choose an
+// upstream by longest matching path prefix, forward the request, and
+// stream the upstream's response back to the client.
+//
+//   import Amalgame.Net.Proxy
+//
+//   ReverseProxy.New()
+//       .Forward("/api", "http://localhost:8081")   // path-prefix route
+//       .Forward("/",    "http://localhost:8080")    // catch-all
+//       .Serve(80)
+//
+// Built entirely on amalgame-net-http: the listener is `Http1.Serve`
+// (one handler closure per connection), the upstream leg is
+// `HttpClient`. HTTPS upstreams work out of the box (the backend URL's
+// scheme drives it — `https://...` negotiates TLS via amalgame-tls).
+//
+// What v0.1 does:
+//   - Longest-prefix routing (declare order-independent — the longest
+//     matching prefix wins, so "/" can sit anywhere as the catch-all).
+//   - Header pass-through with hop-by-hop stripping (RFC 7230 §6.1):
+//     Connection / Keep-Alive / TE / Trailer / Transfer-Encoding /
+//     Upgrade / Proxy-* are dropped, plus Host + Content-Length which
+//     the upstream client recomputes.
+//   - X-Forwarded-For injection (append-aware: extends an existing
+//     chain rather than overwriting it). On by default.
+//   - Faithful response relay: status + body + non-hop-by-hop headers
+//     (Content-Type, Set-Cookie, Location, cache headers, …).
+//
+// What v0.1 does NOT do yet (see docs/proposals/beyond-http.md §1-2):
+//   - Load balancing across N upstreams (v0.2 — UpstreamPool, health
+//     checks, round-robin / least-conn / ip-hash).
+//   - WebSocket transparent forwarding (needs connection hijack).
+//   - Streaming bodies > 1 MiB: amalgame-net-http's HttpClient reads
+//     up to 1 MiB per response today, so very large proxied bodies are
+//     truncated. Fine for APIs/pages; raise once the client streams.
+//   - Per-upstream connect/read timeout enforcement: `Timeout(sec)` is
+//     stored but not yet pushed into the client (net-http's client has
+//     no timeout knob in v0.11). Kept so the surface is stable.
+//   - Path rewriting / prefix stripping: the full original target
+//     (path + query) is forwarded verbatim (nginx `proxy_pass` without
+//     a trailing slash). Strip-prefix is a v0.2 option.
+
+namespace Amalgame.Net.Proxy
+
+import Amalgame.Collections
+import Amalgame.String
+import Amalgame.Net.Http
+
+// ─────────────────────────────────────────────────────────────────
+// ProxyRoute — one (path prefix → upstream base URL) mapping.
+// ─────────────────────────────────────────────────────────────────
+public class ProxyRoute {
+    public Prefix:  string         // "/api" — matched against req.Path
+    public Backend: string         // "http://host:port" — no trailing slash
+
+    public ProxyRoute(string prefix, string backend) {
+        this.Prefix  = prefix
+        this.Backend = backend
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// ReverseProxy — the proxy itself.
+// ─────────────────────────────────────────────────────────────────
+public class ReverseProxy {
+    public Routes:     List<ProxyRoute>
+    public AddXff:     bool          // inject X-Forwarded-For (default true)
+    public TimeoutSec: int           // upstream timeout (stored; see header note)
+
+    public ReverseProxy() {
+        this.Routes     = new List<ProxyRoute>()
+        this.AddXff     = true
+        this.TimeoutSec = 30
+    }
+
+    public static ReverseProxy New() { return new ReverseProxy() }
+
+    // ── Configuration (fluent) ───────────────────────
+    // Register an upstream for a path prefix. Order doesn't matter —
+    // Handle() picks the longest matching prefix per request.
+    public ReverseProxy Forward(string prefix, string backend) {
+        this.Routes.Add(new ProxyRoute(prefix, backend))
+        return this
+    }
+    public ReverseProxy Timeout(int sec)              { this.TimeoutSec = sec; return this }
+    public ReverseProxy WithXForwardedFor(bool on)    { this.AddXff = on;      return this }
+
+    // ── Routing ──────────────────────────────────────
+    // Longest matching prefix wins → "" when nothing matches.
+    public string MatchBackend(string path) {
+        var best:    string = ""
+        var bestLen: int    = -1
+        let n: int = this.Routes.Count()
+        for i in 0..n {
+            let r: ProxyRoute = this.Routes.Get(i)
+            if (ReverseProxy.PrefixMatches(r.Prefix, path)) {
+                let pl: int = String_Length(r.Prefix)
+                if (pl > bestLen) {
+                    bestLen = pl
+                    best    = r.Backend
+                }
+            }
+        }
+        return best
+    }
+
+    // A prefix P matches path Q when Q == P, Q starts with "P/", or
+    // P is the "/" catch-all. The boundary check stops "/api" from
+    // matching "/apixyz".
+    private static bool PrefixMatches(string prefix, string path) {
+        if (prefix == "/")     { return true }
+        if (path == prefix)    { return true }
+        return String_StartsWith(path, prefix + "/")
+    }
+
+    // Hop-by-hop headers (RFC 7230 §6.1) plus the two the upstream
+    // client recomputes itself (Host from the URL, Content-Length from
+    // the body). All compared lower-cased — req.Headers keys are
+    // already lowercased by the HTTP layer.
+    public static bool IsHopByHop(string nameLower) {
+        if (nameLower == "connection")          { return true }
+        if (nameLower == "keep-alive")          { return true }
+        if (nameLower == "proxy-authenticate")  { return true }
+        if (nameLower == "proxy-authorization") { return true }
+        if (nameLower == "te")                  { return true }
+        if (nameLower == "trailer")             { return true }
+        if (nameLower == "transfer-encoding")   { return true }
+        if (nameLower == "upgrade")             { return true }
+        if (nameLower == "host")                { return true }
+        if (nameLower == "content-length")      { return true }
+        return false
+    }
+
+    // X-Forwarded-For value for the upstream request: the client IP,
+    // appended to any inbound chain (so a proxy-in-front's XFF is
+    // preserved per RFC 7239 semantics).
+    public string ForwardedFor(HttpRequest req) {
+        let ip:       string = ReverseProxy.ClientIp(req)
+        let existing: string = req.Header("x-forwarded-for")
+        if (String_Length(existing) > 0) {
+            return existing + ", " + ip
+        }
+        return ip
+    }
+
+    // RemoteAddr is "ip:port" — strip the port (last colon). IPv6
+    // brackets survive as-is; v0.1 keeps it simple.
+    private static string ClientIp(HttpRequest req) {
+        let addr: string = req.RemoteAddr
+        let n: int = String_Length(addr)
+        if (n == 0) { return "-" }
+        var cut: int = -1
+        var i: int = 0
+        while (i < n) {
+            if (String_CharAt1(addr, i) == ":") { cut = i }
+            i = i + 1
+        }
+        if (cut > 0) { return String_Substring(addr, 0, cut) }
+        return addr
+    }
+
+    // ── Core: proxy one request ──────────────────────
+    // Never throws — a missing upstream or a failed dial produces a
+    // proper HttpResponse the caller can ship.
+    public HttpResponse Handle(HttpRequest req) {
+        let backend: string = this.MatchBackend(req.Path)
+        if (String_Length(backend) == 0) {
+            return HttpResponse.New().Status(502).Text("no upstream for " + req.Path)
+        }
+        // Forward the full original target (path + query) verbatim.
+        let target: string = backend + req.RawTarget
+        let b = HttpClient.Request(req.Method, target)
+
+        // Pass request headers through, minus hop-by-hop / rewritten.
+        let keys: List<string> = req.Headers.Keys()
+        let kn: int = keys.Count()
+        for i in 0..kn {
+            let k: string = keys.Get(i)
+            if (!ReverseProxy.IsHopByHop(k)) {
+                b.Header(k, req.Headers.Get(k))
+            }
+        }
+        if (this.AddXff) {
+            b.Header("X-Forwarded-For", this.ForwardedFor(req))
+        }
+        if (String_Length(req.Body) > 0) {
+            b.BodyText(req.Body)
+        }
+
+        let up: HttpResponse = b.Send()
+
+        // Relay the upstream response faithfully.
+        let out: HttpResponse = HttpResponse.New()
+        out.StatusCode = up.StatusCode
+        out.BodyText   = up.BodyText
+        let upKeys: List<string> = up.Headers.Keys()
+        let un: int = upKeys.Count()
+        for i in 0..un {
+            let k: string = upKeys.Get(i)
+            if (!ReverseProxy.IsHopByHop(k)) {
+                out.Headers.Set(k, up.Headers.Get(k))
+            }
+        }
+        return out
+    }
+
+    // ── Serve ────────────────────────────────────────
+    // Single-thread accept loop. Use for local dev / small fronts.
+    public int Serve(int port) {
+        let proxy = this
+        let handler = conn => {
+            let req:  HttpRequest  = HttpRequest.FromH1Conn(conn)
+            let resp: HttpResponse = proxy.Handle(req)
+            resp.WriteToH1Conn(conn)
+            return 0
+        }
+        return Http1.Serve(port, handler)
+    }
+
+    // Thread-per-connection — the production default, since each
+    // proxied request blocks on an upstream round-trip.
+    public int ServeMt(int port) {
+        let proxy = this
+        let handler = conn => {
+            let req:  HttpRequest  = HttpRequest.FromH1Conn(conn)
+            let resp: HttpResponse = proxy.Handle(req)
+            resp.WriteToH1Conn(conn)
+            return 0
+        }
+        return Http1.ServeMt(port, handler)
+    }
+}
