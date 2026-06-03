@@ -55,12 +55,14 @@ import Amalgame.Threading
 public class UpstreamBackend {
     public Url:    string          // "http://host:port" — no trailing slash
     public Weight: int             // relative share (>= 1)
+    public Active: int             // in-flight requests (least_conn, v0.2.1)
 
     public UpstreamBackend(string url, int weight) {
         this.Url    = url
         var w: int = weight
         if (w < 1) { w = 1 }
         this.Weight = w
+        this.Active = 0
     }
 }
 
@@ -102,6 +104,7 @@ public class UpstreamPool {
     public UpstreamPool AddWeighted(string url, int w) { this.Backends.Add(new UpstreamBackend(url, w)); return this }
     public UpstreamPool RoundRobin()                   { this.Strategy = "round_robin"; return this }
     public UpstreamPool IpHash()                       { this.Strategy = "ip_hash";     return this }
+    public UpstreamPool LeastConnections()             { this.Strategy = "least_conn";  return this }
 
     // ── Pick a backend URL for this request ──────────
     // "" when the pool is empty. ip_hash is deterministic per IP;
@@ -114,19 +117,63 @@ public class UpstreamPool {
             let only: UpstreamBackend = this.Backends.Get(0)
             return only.Url
         }
+        Threading.MutexLock(this.Mu)
+        let idx: int = this.selectIndexLocked(clientIp, n)
+        Threading.MutexUnlock(this.Mu)
+        let chosen: UpstreamBackend = this.Backends.Get(idx)
+        return chosen.Url
+    }
+
+    // v0.2.1: managed pick — returns the chosen UpstreamBackend and,
+    // for least_conn, bumps its Active count under the lock. Pair every
+    // call with Release(backend) once the upstream round-trip finishes
+    // (Handle does this). null only when the pool is empty.
+    public UpstreamBackend PickBackend(string clientIp) {
+        let n: int = this.Backends.Count()
+        if (n == 0) { return null }
+        Threading.MutexLock(this.Mu)
+        var idx: int = 0
+        if (n > 1) { idx = this.selectIndexLocked(clientIp, n) }
+        let chosen: UpstreamBackend = this.Backends.Get(idx)
+        if (this.Strategy == "least_conn") { chosen.Active = chosen.Active + 1 }
+        Threading.MutexUnlock(this.Mu)
+        return chosen
+    }
+
+    // Decrement a backend's active-connection count (least_conn).
+    // No-op-safe: null backend, or already-zero Active (no underflow).
+    public void Release(UpstreamBackend b) {
+        if (b == null) { return }
+        Threading.MutexLock(this.Mu)
+        if (b.Active > 0) { b.Active = b.Active - 1 }
+        Threading.MutexUnlock(this.Mu)
+    }
+
+    // Strategy selection → backend index. Caller MUST hold Mu (this
+    // advances the round-robin cursor). For least_conn it picks the
+    // backend with the fewest in-flight requests (ties → first).
+    private int selectIndexLocked(string clientIp, int n) {
+        if (this.Strategy == "least_conn") {
+            var best:       int = 0
+            var bestActive: int = -1
+            for i in 0..n {
+                let b: UpstreamBackend = this.Backends.Get(i)
+                if (bestActive < 0 || b.Active < bestActive) {
+                    bestActive = b.Active
+                    best       = i
+                }
+            }
+            return best
+        }
         let total: int = UpstreamPool.TotalWeight(this.Backends)
         var pos: int = 0
         if (this.Strategy == "ip_hash") {
             pos = UpstreamPool.HashStr(clientIp) % total
         } else {
-            Threading.MutexLock(this.Mu)
             pos = this.Cursor % total
             this.Cursor = (this.Cursor + 1) % total
-            Threading.MutexUnlock(this.Mu)
         }
-        let idx: int = UpstreamPool.WeightedIndex(this.Backends, pos)
-        let chosen: UpstreamBackend = this.Backends.Get(idx)
-        return chosen.Url
+        return UpstreamPool.WeightedIndex(this.Backends, pos)
     }
 
     // Sum of weights (each >= 1, so >= count).
@@ -330,8 +377,14 @@ public class ReverseProxy {
         // Resolve the upstream: a load-balanced pool picks per request
         // (sticky by client IP for ip_hash), else the single backend.
         var backend: string = route.Backend
+        var poolBackend: UpstreamBackend = null
         if (route.Pool != null) {
-            backend = route.Pool.Pick(ReverseProxy.ClientIp(req))
+            poolBackend = route.Pool.PickBackend(ReverseProxy.ClientIp(req))
+            if (poolBackend != null) {
+                backend = poolBackend.Url
+            } else {
+                backend = ""
+            }
         }
         if (String_Length(backend) == 0) {
             return HttpResponse.New().Status(502).Text("no upstream for " + req.Path)
@@ -357,6 +410,10 @@ public class ReverseProxy {
         }
 
         let up: HttpResponse = b.Send()
+        // Upstream round-trip done — release the least_conn slot.
+        if (route.Pool != null) {
+            route.Pool.Release(poolBackend)
+        }
 
         // Relay the upstream response faithfully.
         let out: HttpResponse = HttpResponse.New()
