@@ -98,7 +98,7 @@ URL — `ForwardPool(prefix, pool)`:
 let pool = UpstreamPool.New()
     .Add("http://node1:8080")
     .AddWeighted("http://node2:8080", 2)   // twice the share
-    .RoundRobin()                          // or .IpHash()
+    .RoundRobin()                          // or .IpHash() / .LeastConnections()
 
 ReverseProxy.New()
     .ForwardPool("/api", pool)
@@ -111,15 +111,17 @@ ReverseProxy.New()
   under `ServeMt` (mutex-guarded cursor).
 - **`IpHash()`** — sticky: a client IP always maps to the same backend
   (session affinity without shared session storage). Deterministic.
+- **`LeastConnections()`** (v0.2.1) — routes each request to the backend
+  with the fewest in-flight requests; the proxy tracks active counts
+  around every upstream round-trip (mutex-guarded, thread-safe).
 
 `pool.Pick(clientIp)` is exposed for unit-testing the selection without
 a socket.
 
 ## Limitations
 
-- **Least-connections** + **active health checks** are **v0.2.1** —
-  both need per-backend live state (active-conn tracking around `Handle`
-  / a background prober).
+- **Active health checks** (probe `/healthz`, auto-eject backends on
+  consecutive 5xx) are **v0.2.2** — they need a background prober.
 - **WebSocket** transparent forwarding needs connection hijack — not yet.
 - **Bodies > 1 MiB**: `amalgame-net-http`'s `HttpClient` reads up to
   1 MiB per upstream response today, so very large proxied bodies are
