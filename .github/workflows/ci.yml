@@ -1,0 +1,112 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Test against amc ${{ matrix.amc-tag }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        amc-tag: [v0.8.74]
+    steps:
+      # net-proxy lives in proxy/ so its sibling deps sit next to it,
+      # matching the local-dev layout the test runner falls back to.
+      - uses: actions/checkout@v4
+        with:
+          path: proxy
+
+      # Core dependency — the listener (Http1) + the upstream leg
+      # (HttpClient). The test runner picks it up via $AMALGAME_NET_HTTP.
+      - uses: actions/checkout@v4
+        with:
+          repository: amalgame-lang/amalgame-net-http
+          ref: v0.11.1
+          path: amalgame-net-http
+
+      # net-http's HTTPS client path links amalgame-tls's runtime.
+      - uses: actions/checkout@v4
+        with:
+          repository: amalgame-lang/amalgame-tls
+          ref: v0.3.0
+          path: amalgame-tls
+
+      # net-http's ServeAsync links amalgame-async (C-only, fake-cache).
+      - uses: actions/checkout@v4
+        with:
+          repository: amalgame-lang/amalgame-async
+          ref: v0.2.2
+          path: amalgame-async
+
+      # The remaining siblings are resolved by the shared test runner
+      # (inherited from amalgame-web) even though net-proxy's facade
+      # only imports Amalgame.Net.Http — providing them keeps the
+      # runner's dep-resolution + transient lockfile happy.
+      - uses: actions/checkout@v4
+        with:
+          repository: amalgame-lang/amalgame-datetime
+          ref: v0.1.0
+          path: amalgame-datetime
+      - uses: actions/checkout@v4
+        with:
+          repository: amalgame-lang/amalgame-random
+          ref: v0.1.0
+          path: amalgame-random
+      - uses: actions/checkout@v4
+        with:
+          repository: amalgame-lang/amalgame-logging
+          ref: v0.1.0
+          path: amalgame-logging
+      - uses: actions/checkout@v4
+        with:
+          repository: amalgame-lang/amalgame-crypto
+          ref: v0.3.0
+          path: amalgame-crypto
+      - uses: actions/checkout@v4
+        with:
+          repository: amalgame-lang/amalgame-database-nosql-redis
+          ref: v0.3.0
+          path: amalgame-database-nosql-redis
+      - uses: actions/checkout@v4
+        with:
+          repository: amalgame-lang/amalgame-threading
+          ref: v0.1.0
+          path: amalgame-threading
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y libgc-dev libssl-dev libnghttp2-dev
+
+      - name: Download amc ${{ matrix.amc-tag }}
+        run: |
+          set -e
+          TAG="${{ matrix.amc-tag }}"
+          VERSION="${TAG#v}"
+          curl -sSL -o amc.tar.gz \
+            "https://github.com/amalgame-lang/Amalgame/releases/download/${TAG}/amc-${VERSION}-linux-x86_64.tar.gz"
+          mkdir -p $RUNNER_TEMP/amc-install
+          tar -xzf amc.tar.gz -C $RUNNER_TEMP/amc-install --strip-components=1
+          echo "AMC=$RUNNER_TEMP/amc-install/bin/amc" >> $GITHUB_ENV
+          echo "AMC_RUNTIME=$RUNNER_TEMP/amc-install/share/amalgame/runtime" >> $GITHUB_ENV
+
+      - name: Run tests
+        working-directory: proxy
+        env:
+          AMALGAME_NET_HTTP: ${{ github.workspace }}/amalgame-net-http
+          AMALGAME_TLS:      ${{ github.workspace }}/amalgame-tls
+          AMALGAME_ASYNC:    ${{ github.workspace }}/amalgame-async
+          AMALGAME_DATETIME: ${{ github.workspace }}/amalgame-datetime
+          AMALGAME_RANDOM:   ${{ github.workspace }}/amalgame-random
+          AMALGAME_LOGGING:  ${{ github.workspace }}/amalgame-logging
+          AMALGAME_CRYPTO:   ${{ github.workspace }}/amalgame-crypto
+          AMALGAME_DB_REDIS: ${{ github.workspace }}/amalgame-database-nosql-redis
+          AMALGAME_THREADING: ${{ github.workspace }}/amalgame-threading
+        run: ./tests/run_tests.sh "$AMC"
