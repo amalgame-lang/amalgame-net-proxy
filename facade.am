@@ -47,17 +47,147 @@ namespace Amalgame.Net.Proxy
 import Amalgame.Collections
 import Amalgame.String
 import Amalgame.Net.Http
+import Amalgame.Threading
 
 // ─────────────────────────────────────────────────────────────────
-// ProxyRoute — one (path prefix → upstream base URL) mapping.
+// UpstreamBackend — one member of a load-balanced pool.
+// ─────────────────────────────────────────────────────────────────
+public class UpstreamBackend {
+    public Url:    string          // "http://host:port" — no trailing slash
+    public Weight: int             // relative share (>= 1)
+
+    public UpstreamBackend(string url, int weight) {
+        this.Url    = url
+        var w: int = weight
+        if (w < 1) { w = 1 }
+        this.Weight = w
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// UpstreamPool — v0.2 load balancing across N backends.
+//
+//   let pool = UpstreamPool.New()
+//       .Add("http://node1:8080")
+//       .AddWeighted("http://node2:8080", 2)
+//       .RoundRobin()              // or .IpHash()
+//   proxy.ForwardPool("/api", pool)
+//
+// Strategies (v0.2):
+//   - round_robin (default) — weighted; cursor advances over the total
+//     weight, so a weight-2 backend gets twice the turns.
+//   - ip_hash — sticky: a client IP always maps to the same backend
+//     (weighted), for session affinity without shared session storage.
+//
+// Deferred to v0.2.1: least-connections (needs active-conn tracking
+// around Handle) + active health checks (needs a background prober).
+// ─────────────────────────────────────────────────────────────────
+public class UpstreamPool {
+    public Backends: List<UpstreamBackend>
+    public Strategy: string        // "round_robin" | "ip_hash"
+    public Cursor:   int           // round-robin position over total weight
+    public Mu:       AmalgameMutex  // guards Cursor under ServeMt
+
+    public UpstreamPool() {
+        this.Backends = new List<UpstreamBackend>()
+        this.Strategy = "round_robin"
+        this.Cursor   = 0
+        this.Mu       = Threading.MutexNew()
+    }
+
+    public static UpstreamPool New() { return new UpstreamPool() }
+
+    // ── Builders ─────────────────────────────────────
+    public UpstreamPool Add(string url)                { this.Backends.Add(new UpstreamBackend(url, 1)); return this }
+    public UpstreamPool AddWeighted(string url, int w) { this.Backends.Add(new UpstreamBackend(url, w)); return this }
+    public UpstreamPool RoundRobin()                   { this.Strategy = "round_robin"; return this }
+    public UpstreamPool IpHash()                       { this.Strategy = "ip_hash";     return this }
+
+    // ── Pick a backend URL for this request ──────────
+    // "" when the pool is empty. ip_hash is deterministic per IP;
+    // round_robin advances a mutex-guarded cursor (thread-safe under
+    // ServeMt).
+    public string Pick(string clientIp) {
+        let n: int = this.Backends.Count()
+        if (n == 0) { return "" }
+        if (n == 1) {
+            let only: UpstreamBackend = this.Backends.Get(0)
+            return only.Url
+        }
+        let total: int = UpstreamPool.TotalWeight(this.Backends)
+        var pos: int = 0
+        if (this.Strategy == "ip_hash") {
+            pos = UpstreamPool.HashStr(clientIp) % total
+        } else {
+            Threading.MutexLock(this.Mu)
+            pos = this.Cursor % total
+            this.Cursor = (this.Cursor + 1) % total
+            Threading.MutexUnlock(this.Mu)
+        }
+        let idx: int = UpstreamPool.WeightedIndex(this.Backends, pos)
+        let chosen: UpstreamBackend = this.Backends.Get(idx)
+        return chosen.Url
+    }
+
+    // Sum of weights (each >= 1, so >= count).
+    private static int TotalWeight(List<UpstreamBackend> bs) {
+        var t: int = 0
+        let n: int = bs.Count()
+        for i in 0..n {
+            let b: UpstreamBackend = bs.Get(i)
+            t = t + b.Weight
+        }
+        return t
+    }
+
+    // Map a position in [0, totalWeight) to a backend index, walking
+    // the cumulative weight bands.
+    private static int WeightedIndex(List<UpstreamBackend> bs, int pos) {
+        var acc: int = 0
+        let n: int = bs.Count()
+        for i in 0..n {
+            let b: UpstreamBackend = bs.Get(i)
+            acc = acc + b.Weight
+            if (pos < acc) { return i }
+        }
+        return n - 1
+    }
+
+    // FNV-1a-style string hash, folded to a non-negative 31-bit int so
+    // ip_hash is deterministic across runs. amc exposes no char→code
+    // primitive (String_CharAt returns a 1-char string, not an int) and
+    // we don't want a crypto/encoding dep just for this, so each char's
+    // "code" is its position in a reference alphabet covering the IPv4 /
+    // IPv6 charset (client IPs are the only input). Chars outside it
+    // collapse to one bucket — fine for load-balancer distribution.
+    private static int HashStr(string s) {
+        let ref: string = "0123456789abcdefABCDEF.:%[]-"
+        var h: int = 2166136261
+        let n: int = String_Length(s)
+        for i in 0..n {
+            let ch: string = String_Substring(s, i, 1)
+            var c: int = String_IndexOf(ref, ch)
+            if (c < 0) { c = 37 }
+            h = (h ^ c) * 16777619
+            h = h & 2147483647
+        }
+        return h
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// ProxyRoute — one (path prefix → upstream) mapping. The upstream is
+// either a single Backend URL or a load-balanced Pool (v0.2).
 // ─────────────────────────────────────────────────────────────────
 public class ProxyRoute {
     public Prefix:  string         // "/api" — matched against req.Path
-    public Backend: string         // "http://host:port" — no trailing slash
+    public Backend: string         // single upstream (empty when Pool is set)
+    public Pool:    UpstreamPool   // null = single Backend; else load-balanced
 
     public ProxyRoute(string prefix, string backend) {
         this.Prefix  = prefix
         this.Backend = backend
+        this.Pool    = null
     }
 }
 
@@ -84,6 +214,14 @@ public class ReverseProxy {
         this.Routes.Add(new ProxyRoute(prefix, backend))
         return this
     }
+    // v0.2: register a load-balanced pool for a path prefix. The pool's
+    // strategy (round-robin / ip-hash) picks the backend per request.
+    public ReverseProxy ForwardPool(string prefix, UpstreamPool pool) {
+        let r = new ProxyRoute(prefix, "")
+        r.Pool = pool
+        this.Routes.Add(r)
+        return this
+    }
     public ReverseProxy Timeout(int sec)              { this.TimeoutSec = sec; return this }
     public ReverseProxy WithXForwardedFor(bool on)    { this.AddXff = on;      return this }
 
@@ -100,6 +238,26 @@ public class ReverseProxy {
                 if (pl > bestLen) {
                     bestLen = pl
                     best    = r.Backend
+                }
+            }
+        }
+        return best
+    }
+
+    // Longest matching route (carries either a single Backend or a
+    // load-balanced Pool), or null when nothing matches. Used by
+    // Handle so pool routes resolve their backend per request.
+    public ProxyRoute MatchRoute(string path) {
+        var best:    ProxyRoute = null
+        var bestLen: int        = -1
+        let n: int = this.Routes.Count()
+        for i in 0..n {
+            let r: ProxyRoute = this.Routes.Get(i)
+            if (ReverseProxy.PrefixMatches(r.Prefix, path)) {
+                let pl: int = String_Length(r.Prefix)
+                if (pl > bestLen) {
+                    bestLen = pl
+                    best    = r
                 }
             }
         }
@@ -165,7 +323,16 @@ public class ReverseProxy {
     // Never throws — a missing upstream or a failed dial produces a
     // proper HttpResponse the caller can ship.
     public HttpResponse Handle(HttpRequest req) {
-        let backend: string = this.MatchBackend(req.Path)
+        let route: ProxyRoute = this.MatchRoute(req.Path)
+        if (route == null) {
+            return HttpResponse.New().Status(502).Text("no upstream for " + req.Path)
+        }
+        // Resolve the upstream: a load-balanced pool picks per request
+        // (sticky by client IP for ip_hash), else the single backend.
+        var backend: string = route.Backend
+        if (route.Pool != null) {
+            backend = route.Pool.Pick(ReverseProxy.ClientIp(req))
+        }
         if (String_Length(backend) == 0) {
             return HttpResponse.New().Status(502).Text("no upstream for " + req.Path)
         }
