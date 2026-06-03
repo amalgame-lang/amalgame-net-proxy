@@ -89,10 +89,37 @@ curl -s http://localhost:8000/        # → "hello from :8080"
 curl -sI http://localhost:8000/       # upstream status + headers relayed
 ```
 
-## Limitations (v0.1)
+## Load balancing (v0.2)
 
-- **Load balancing** across N upstreams (round-robin / least-conn /
-  ip-hash, health checks) is **v0.2** — `UpstreamPool`.
+Front a path prefix with a **pool** of backends instead of a single
+URL — `ForwardPool(prefix, pool)`:
+
+```amalgame
+let pool = UpstreamPool.New()
+    .Add("http://node1:8080")
+    .AddWeighted("http://node2:8080", 2)   // twice the share
+    .RoundRobin()                          // or .IpHash()
+
+ReverseProxy.New()
+    .ForwardPool("/api", pool)
+    .Forward("/", "http://web:8080")        // single backends still work
+    .ServeMt(80)
+```
+
+- **`RoundRobin()`** (default) — weighted: the cursor advances over the
+  total weight, so a weight-2 backend takes twice the turns. Thread-safe
+  under `ServeMt` (mutex-guarded cursor).
+- **`IpHash()`** — sticky: a client IP always maps to the same backend
+  (session affinity without shared session storage). Deterministic.
+
+`pool.Pick(clientIp)` is exposed for unit-testing the selection without
+a socket.
+
+## Limitations
+
+- **Least-connections** + **active health checks** are **v0.2.1** —
+  both need per-backend live state (active-conn tracking around `Handle`
+  / a background prober).
 - **WebSocket** transparent forwarding needs connection hijack — not yet.
 - **Bodies > 1 MiB**: `amalgame-net-http`'s `HttpClient` reads up to
   1 MiB per upstream response today, so very large proxied bodies are

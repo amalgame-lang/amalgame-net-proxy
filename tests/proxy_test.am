@@ -89,6 +89,69 @@ public class Program {
             Console.WriteLine("[FAIL] XFF append: " + p.ForwardedFor(req2))
         }
 
+        // ── 9. Round-robin cycles through all backends ───────────
+        let rr = UpstreamPool.New()
+            .Add("http://n1:8080")
+            .Add("http://n2:8080")
+            .Add("http://n3:8080")
+            .RoundRobin()
+        let a1: string = rr.Pick("")
+        let a2: string = rr.Pick("")
+        let a3: string = rr.Pick("")
+        let a4: string = rr.Pick("")
+        // 3 distinct over 3 picks, then wraps to the first.
+        let rrCycles: bool = a1 != a2 && a2 != a3 && a1 != a3 && a4 == a1
+        if (rrCycles) {
+            Console.WriteLine("[PASS] round-robin cycles n1→n2→n3→n1")
+        } else {
+            Console.WriteLine("[FAIL] round-robin: " + a1 + "," + a2 + "," + a3 + "," + a4)
+        }
+
+        // ── 10. Weighted round-robin honours weights ─────────────
+        let wrr = UpstreamPool.New()
+            .AddWeighted("http://big:8080", 2)
+            .AddWeighted("http://small:8080", 1)
+            .RoundRobin()
+        var bigCount: int = 0
+        for i in 0..3 {
+            if (wrr.Pick("") == "http://big:8080") { bigCount = bigCount + 1 }
+        }
+        // weight 2 vs 1 over a 3-pick cycle → big twice, small once.
+        if (bigCount == 2) {
+            Console.WriteLine("[PASS] weighted RR: weight-2 backend gets 2/3 of the turns")
+        } else {
+            Console.WriteLine("[FAIL] weighted RR big count: " + String_FromInt(bigCount))
+        }
+
+        // ── 11. ip_hash is sticky (same IP → same backend) ───────
+        let ih = UpstreamPool.New()
+            .Add("http://x:8080")
+            .Add("http://y:8080")
+            .Add("http://z:8080")
+            .IpHash()
+        let pa: string = ih.Pick("203.0.113.9")
+        let pb: string = ih.Pick("203.0.113.9")
+        let inPool: bool = pa == "http://x:8080" || pa == "http://y:8080" || pa == "http://z:8080"
+        if (pa == pb && inPool) {
+            Console.WriteLine("[PASS] ip_hash sticky: same IP → same backend")
+        } else {
+            Console.WriteLine("[FAIL] ip_hash: " + pa + " vs " + pb)
+        }
+
+        // ── 12. ForwardPool wires a pool into a route ────────────
+        let app12 = ReverseProxy.New()
+            .Forward("/", "http://web:8080")
+            .ForwardPool("/api", UpstreamPool.New().Add("http://api1:9").Add("http://api2:9").RoundRobin())
+        let routeApi: ProxyRoute = app12.MatchRoute("/api/users")
+        let routeWeb: ProxyRoute = app12.MatchRoute("/about")
+        let poolOk: bool = routeApi != null && routeApi.Pool != null
+            && routeWeb != null && routeWeb.Pool == null && routeWeb.Backend == "http://web:8080"
+        if (poolOk) {
+            Console.WriteLine("[PASS] ForwardPool: /api → pool, / → single backend")
+        } else {
+            Console.WriteLine("[FAIL] ForwardPool routing")
+        }
+
         Console.WriteLine("done")
     }
 }

@@ -16,14 +16,14 @@
 
 [package]
 name              = "amalgame-net-proxy"
-version           = "0.1.0"
+version           = "0.2.0"
 license           = "Apache-2.0"
-description       = "HTTP/1.1 reverse proxy — ReverseProxy.Forward(prefix, backend) routes by longest path prefix, injects X-Forwarded-For, strips hop-by-hop headers, and serves on top of amalgame-net-http. The nginx/Apache front-door slice of the Mosaic stack."
+description       = "HTTP/1.1 reverse proxy + load balancing for the Mosaic stack. v0.2.0: UpstreamPool with weighted round-robin + ip-hash (sticky) across N backends (ForwardPool). v0.1: longest-prefix routing, X-Forwarded-For, hop-by-hop stripping, HTTPS upstreams. The nginx/Apache front-door slice."
 required-amalgame = ">=0.8.58"
 schema-version    = 1
 
 [stdlib]
-classes   = ["ReverseProxy", "ProxyRoute"]
+classes   = ["ReverseProxy", "ProxyRoute", "UpstreamPool", "UpstreamBackend"]
 header    = "runtime/Amalgame_Net_Proxy.h"
 namespace = "Amalgame.Net.Proxy"
 facade    = "facade.am"
